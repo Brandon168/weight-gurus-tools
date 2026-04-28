@@ -37,7 +37,7 @@ This repo follows each tool's native extension point instead of forcing one layo
 
 Recommended install path:
 
-- Download from GitHub Releases for your platform and extract the matching asset.
+- Download the latest GitHub Release for your platform and extract the matching asset.
 
 For example, with `v1.0.0`:
 
