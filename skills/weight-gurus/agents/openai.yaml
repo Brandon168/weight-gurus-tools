@@ -1,0 +1,4 @@
+interface:
+  display_name: "Weight Gurus"
+  short_description: "Use for live Weight Gurus pulls and markdown note updates."
+  default_prompt: "Use weight-gurus-cli to pull current Weight Gurus logs and update my Weight Log markdown section with --confirm when I request a write."
