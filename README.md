@@ -10,10 +10,11 @@ It ships three integration surfaces:
 
 ## Is this "standard"?
 
-Partly. The CLI is standard. The skill packaging is standard for tools that use `SKILL.md` folders, but there is no single cross-agent standard that all coding tools share.
+Yes, for the skill bundle. OpenAI documents `SKILL.md` skills as following the Agent Skills open standard, and this repo packages the skill in that format.
 
 - Codex: uses `~/.codex/skills/<name>/SKILL.md`
 - Hermes: uses `~/.hermes/skills/<name>/SKILL.md`
+- Any other `SKILL.md`-aware tool: install the same folder into that tool's skill location
 - Claude Code: uses subagents in `~/.claude/agents/*.md` or slash commands in `~/.claude/commands/*.md`
 
 This repo follows each tool's native extension point instead of forcing one layout everywhere.
