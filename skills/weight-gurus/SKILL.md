@@ -10,11 +10,18 @@ Use `weight-gurus-cli` for live Weight Gurus pulls and markdown note updates. Ke
 ## Key Inputs
 
 - `WEIGHT_GURUS_EMAIL` / `WEIGHT_GURUS_PASSWORD`, or pass `--email` / `--password`.
+- `WEIGHT_GURUS_CONFIG_PATH` for setup persistence and offline status checks.
 - `WEIGHT_GURUS_BASE_URL` to override API base (default `https://api.weightgurus.com`).
 - `WEIGHT_GURUS_NOTE_PATH` for vault commands, or pass `--file /path/to/note.md`.
+- macOS only: Keychain service `WeightGurus` when explicit credentials are omitted.
 
 ## Command Map
 
+- Run setup:
+  - `weight-gurus-cli setup`
+  - `weight-gurus-cli setup --write`
+- Check credential readiness:
+  - `weight-gurus-cli auth status`
 - Check credentials:
   - `weight-gurus-cli auth test`
 - Pull raw operations:

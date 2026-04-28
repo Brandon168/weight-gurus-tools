@@ -21,28 +21,38 @@ This repo follows each tool's native extension point instead of forcing one layo
 ## Features
 
 - `auth test`
+- `auth status`
 - `weights raw`
 - `weights weekly`
+- `setup`
 - `vault preview`
 - `vault update --confirm`
-- macOS Keychain lookup via service `WeightGurus`
+- `WEIGHT_GURUS_CONFIG_PATH` config fallback (JSON file)
+- optional macOS Keychain lookup via service `WeightGurus`
 - JSON stdout for agent-friendly use
 - explicit write confirmation for markdown updates
 
 ## Install the CLI
 
-Requirements:
+Recommended install path:
 
-- Rust toolchain
-- macOS Keychain access if you want credential lookup from `WeightGurus`
+- Download from GitHub Releases for your platform and extract the matching asset.
 
-Build a release binary:
+For example, with `v1.0.0`:
+
+- Linux: `weight-gurus-cli-linux-x86_64.tar.gz`
+- macOS (Apple Silicon): `weight-gurus-cli-macos-aarch64.tar.gz`
+- Windows: `weight-gurus-cli-windows-x86_64.zip`
 
 ```bash
-cargo build --release --bin weight-gurus-cli
+gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-linux-x86_64.tar.gz"
+gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-macos-aarch64.tar.gz"
+gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-windows-x86_64.zip"
 ```
 
-Or install onto your PATH:
+Unpack and run `weight-gurus-cli` from the extracted archive.
+
+Or build locally:
 
 ```bash
 cargo install --path . --locked
@@ -52,13 +62,21 @@ cargo install --path . --locked
 
 Supported inputs:
 
-- macOS Keychain service `WeightGurus`
 - `WEIGHT_GURUS_EMAIL`
 - `WEIGHT_GURUS_PASSWORD`
 - `WEIGHT_GURUS_BASE_URL` for API overrides and tests
 - `WEIGHT_GURUS_NOTE_PATH` for markdown update commands
+- `WEIGHT_GURUS_CONFIG_PATH` to point at a JSON config file
+- `setup` stores local settings to `~/.config/weight-gurus/config.json` by default
+- macOS only: Keychain service `WeightGurus`
 
 You can also pass `--email`, `--password`, and `--file` explicitly.
+
+Cross-platform auth behavior:
+
+- macOS: if no credentials are passed, the CLI can fall back to Keychain service `WeightGurus`
+- Linux and Windows: pass `--email` and `--password`, or set `WEIGHT_GURUS_EMAIL` and `WEIGHT_GURUS_PASSWORD`
+- All platforms: `--file` or `WEIGHT_GURUS_NOTE_PATH` is required for markdown update commands
 
 ## Install in Codex
 
@@ -116,6 +134,8 @@ Use the weight-gurus subagent to preview an update to my Weight Logs note.
 
 ```bash
 weight-gurus-cli auth test
+weight-gurus-cli auth status
+weight-gurus-cli setup --write
 weight-gurus-cli weights raw --start 2026-01-01 --end 2026-03-31
 weight-gurus-cli weights weekly --start 2026-01-01 --end 2026-03-31
 weight-gurus-cli vault preview --file "/path/to/Weight Note.md"

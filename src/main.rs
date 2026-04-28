@@ -8,12 +8,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const KEYCHAIN_SERVICE_NAME: &str = "WeightGurus";
 const CHART_LINE_COLOR: &str = "#38bdf8";
 const WG_DEFAULT_BASE_URL: &str = "https://api.weightgurus.com";
+const WG_DEFAULT_CONFIG_FILE: &str = "config.json";
+const WG_DEFAULT_CONFIG_DIR: &str = "weight-gurus";
+const WG_CONFIG_ENV_VAR: &str = "WEIGHT_GURUS_CONFIG_PATH";
 
 #[derive(Parser)]
 #[command(
@@ -25,14 +31,19 @@ struct Cli {
     email: Option<String>,
     #[arg(long, env = "WEIGHT_GURUS_PASSWORD")]
     password: Option<String>,
-    #[arg(long, env = "WEIGHT_GURUS_BASE_URL", default_value = WG_DEFAULT_BASE_URL)]
-    base_url: String,
+    #[arg(long, env = "WEIGHT_GURUS_BASE_URL")]
+    base_url: Option<String>,
+    #[arg(long, env = "WEIGHT_GURUS_NOTE_PATH")]
+    note_path: Option<String>,
+    #[arg(long, env = WG_CONFIG_ENV_VAR)]
+    config_path: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    Setup(SetupArgs),
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -50,6 +61,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum AuthCommand {
     Test,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -74,7 +86,7 @@ struct TimeRange {
 
 #[derive(Args)]
 struct VaultArgs {
-    #[arg(long, env = "WEIGHT_GURUS_NOTE_PATH")]
+    #[arg(long)]
     file: Option<String>,
     #[arg(long)]
     start: Option<String>,
@@ -108,10 +120,82 @@ struct WeightOperationResponse {
     operations: Vec<WeightOperation>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedConfig {
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub base_url: Option<String>,
+    pub note_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LoginResponse {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SetupResult {
+    action: &'static str,
+    platform: &'static str,
+    config_path: String,
+    config_exists: bool,
+    config_written: bool,
+    email_present: bool,
+    email_source: &'static str,
+    password_present: bool,
+    password_source: &'static str,
+    base_url: String,
+    note_path: Option<String>,
+    note_path_source: &'static str,
+    next_steps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthStatusResult {
+    can_authenticate: bool,
+    email_present: bool,
+    email_source: &'static str,
+    password_present: bool,
+    password_source: &'static str,
+    base_url: String,
+    note_path: Option<String>,
+    note_path_source: &'static str,
+    config_file: Option<String>,
+    config_exists: bool,
+    keychain_supported: bool,
+    keychain_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CredentialSource {
+    Cli,
+    Config,
+    Keychain,
+    Missing,
+}
+
+impl CredentialSource {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Config => "config",
+            Self::Keychain => "keychain",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    #[arg(long)]
+    write: bool,
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    note_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,83 +257,149 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let (email, password) = resolve_credentials(cli.email, cli.password)?;
-    let mut client = WeightGurusClient::new(&cli.base_url, &email, &password).await?;
-    client.login().await?;
+    let config_path = resolve_config_path(cli.config_path.as_deref());
+    let config = match config_path.as_ref() {
+        Some(path) => read_config_file(path)?,
+        None => None,
+    };
+    let resolved_base_url = resolve_base_url(cli.base_url.as_deref(), config.as_ref());
 
-    let payload = match cli.command {
+    let payload = match &cli.command {
+        Commands::Setup(args) => setup_command(
+            &cli,
+            args,
+            config_path.as_deref(),
+            &config,
+            resolved_base_url.clone(),
+        )?,
+        Commands::Auth {
+            command: AuthCommand::Status,
+        } => auth_status(
+            cli.email.clone(),
+            cli.password.clone(),
+            config_path.as_deref(),
+            &config,
+            cli.note_path.as_deref(),
+            resolved_base_url.clone(),
+        )?,
         Commands::Auth {
             command: AuthCommand::Test,
-        } => auth_test()?,
-        Commands::Weights {
-            command: WeightsCommand::Raw(range),
         } => {
-            let weights = client
-                .get_raw_weights(
-                    parse_opt_datetime(&range.start)?,
-                    parse_opt_datetime(&range.end)?,
-                )
-                .await?;
-            serde_json::json!({
-                "entries": weights,
-                "count": weights.len(),
-                "start": range.start,
-                "end": range.end,
-            })
+            let credentials = resolve_credentials_required(
+                cli.email.clone(),
+                cli.password.clone(),
+                config.as_ref(),
+            )?;
+            let mut client = WeightGurusClient::new(
+                &resolved_base_url,
+                &credentials.email,
+                &credentials.password,
+            )
+            .await?;
+            client.login().await?;
+            auth_test()?
         }
-        Commands::Weights {
-            command: WeightsCommand::Weekly(range),
-        } => {
-            let weights = client
-                .get_raw_weights(
-                    parse_opt_datetime(&range.start)?,
-                    parse_opt_datetime(&range.end)?,
-                )
-                .await?;
-            let rows = build_weekly_rows(&weights)?;
-            let filtered_rows = filter_rows_after(&rows, parse_opt_naive_date(&range.start)?);
-            let serialized_rows: Vec<WeeklyRow> = serialize_weekly_rows(&filtered_rows);
-            serde_json::json!({
-                "entries": serialized_rows,
-                "summary": summarize_rows(&filtered_rows),
-                "count": filtered_rows.len(),
-                "start": range.start,
-                "end": range.end,
-            })
-        }
-        Commands::Vault {
-            command: VaultCommand::Preview(args),
-        } => {
-            let file = resolve_note_path(args.file.as_deref())?;
-            let operation_rows = client
-                .get_raw_weights(
-                    parse_opt_datetime(&args.start)?,
-                    parse_opt_datetime(&args.end)?,
-                )
-                .await?;
-            let weekly_rows = build_weekly_rows(&operation_rows)?;
-            let explicit_start = parse_opt_naive_date(&args.start)?;
-            let result = preview_vault_update(&file, &weekly_rows, explicit_start)?;
-            serde_json::to_value(result)?
-        }
-        Commands::Vault {
-            command: VaultCommand::Update(args),
-        } => {
-            if !args.confirm {
-                bail!("vault update requires --confirm");
-            }
-            let file = resolve_note_path(args.args.file.as_deref())?;
+        command => {
+            let credentials = resolve_credentials_required(
+                cli.email.clone(),
+                cli.password.clone(),
+                config.as_ref(),
+            )?;
+            let mut client = WeightGurusClient::new(
+                &resolved_base_url,
+                &credentials.email,
+                &credentials.password,
+            )
+            .await?;
+            client.login().await?;
 
-            let operation_rows = client
-                .get_raw_weights(
-                    parse_opt_datetime(&args.args.start)?,
-                    parse_opt_datetime(&args.args.end)?,
-                )
-                .await?;
-            let weekly_rows = build_weekly_rows(&operation_rows)?;
-            let explicit_start = parse_opt_naive_date(&args.args.start)?;
-            let result = apply_vault_update(&file, &weekly_rows, explicit_start)?;
-            serde_json::to_value(result)?
+            match command {
+                Commands::Auth {
+                    command: AuthCommand::Test,
+                } => unreachable!(),
+                Commands::Auth {
+                    command: AuthCommand::Status,
+                } => unreachable!(),
+                Commands::Weights {
+                    command: WeightsCommand::Raw(range),
+                } => {
+                    let weights = client
+                        .get_raw_weights(
+                            parse_opt_datetime(&range.start)?,
+                            parse_opt_datetime(&range.end)?,
+                        )
+                        .await?;
+                    serde_json::json!({
+                        "entries": weights,
+                        "count": weights.len(),
+                        "start": range.start.clone(),
+                        "end": range.end.clone(),
+                    })
+                }
+                Commands::Weights {
+                    command: WeightsCommand::Weekly(range),
+                } => {
+                    let weights = client
+                        .get_raw_weights(
+                            parse_opt_datetime(&range.start)?,
+                            parse_opt_datetime(&range.end)?,
+                        )
+                        .await?;
+                    let rows = build_weekly_rows(&weights)?;
+                    let filtered_rows =
+                        filter_rows_after(&rows, parse_opt_naive_date(&range.start)?);
+                    let serialized_rows: Vec<WeeklyRow> = serialize_weekly_rows(&filtered_rows);
+                    serde_json::json!({
+                        "entries": serialized_rows,
+                        "summary": summarize_rows(&filtered_rows),
+                        "count": filtered_rows.len(),
+                        "start": range.start.clone(),
+                        "end": range.end.clone(),
+                    })
+                }
+                Commands::Vault {
+                    command: VaultCommand::Preview(args),
+                } => {
+                    let file = resolve_note_path(
+                        args.file.as_deref(),
+                        cli.note_path.as_deref(),
+                        config.as_ref(),
+                    )?;
+                    let operation_rows = client
+                        .get_raw_weights(
+                            parse_opt_datetime(&args.start)?,
+                            parse_opt_datetime(&args.end)?,
+                        )
+                        .await?;
+                    let weekly_rows = build_weekly_rows(&operation_rows)?;
+                    let explicit_start = parse_opt_naive_date(&args.start)?;
+                    let result = preview_vault_update(&file, &weekly_rows, explicit_start)?;
+                    serde_json::to_value(result)?
+                }
+                Commands::Vault {
+                    command: VaultCommand::Update(args),
+                } => {
+                    if !args.confirm {
+                        bail!("vault update requires --confirm");
+                    }
+                    let file = resolve_note_path(
+                        args.args.file.as_deref(),
+                        cli.note_path.as_deref(),
+                        config.as_ref(),
+                    )?;
+                    let operation_rows = client
+                        .get_raw_weights(
+                            parse_opt_datetime(&args.args.start)?,
+                            parse_opt_datetime(&args.args.end)?,
+                        )
+                        .await?;
+                    let weekly_rows = build_weekly_rows(&operation_rows)?;
+                    let explicit_start = parse_opt_naive_date(&args.args.start)?;
+                    let result = apply_vault_update(&file, &weekly_rows, explicit_start)?;
+                    serde_json::to_value(result)?
+                }
+                _ => unreachable!(),
+            }
         }
     };
 
@@ -264,26 +414,344 @@ fn auth_test() -> Result<Value> {
     }))
 }
 
-fn resolve_note_path(path: Option<&str>) -> Result<String> {
+fn setup_command(
+    cli: &Cli,
+    args: &SetupArgs,
+    config_path: Option<&Path>,
+    config: &Option<PersistedConfig>,
+    base_url: String,
+) -> Result<Value> {
+    let resolved_email = pick_credential(
+        "email",
+        cli.email.clone(),
+        config.as_ref(),
+        |cfg| cfg.email.clone(),
+        true,
+    );
+    let resolved_password = pick_credential(
+        "password",
+        cli.password.clone(),
+        config.as_ref(),
+        |cfg| cfg.password.clone(),
+        true,
+    );
+
+    let mut next_steps = vec![
+        "weight-gurus-cli auth test".to_string(),
+        "weight-gurus-cli weights weekly".to_string(),
+        "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
+    ];
+    let mut email = resolved_email.0;
+    let mut password = resolved_password.0;
+    let mut note_path = args
+        .note_path
+        .clone()
+        .or(cli.note_path.clone())
+        .or_else(|| config.as_ref().and_then(|c| c.note_path.clone()));
+
+    if args.write {
+        if !args.non_interactive {
+            if email.is_none() {
+                email = prompt_if_missing("weight gurus email", email.as_deref())?;
+            }
+            if password.is_none() {
+                password = prompt_if_missing("weight gurus password", password.as_deref())?;
+            }
+            if note_path.is_none() {
+                note_path = prompt_if_missing("weight log note path", None)?;
+            }
+        }
+        if email.is_none() || password.is_none() || note_path.is_none() {
+            bail!("setup --write requires email, password, and note path");
+        }
+
+        let path = match config_path {
+            Some(path) => path.to_owned(),
+            None => {
+                let default = resolve_config_path(None)
+                    .context("could not determine default config path for setup write")?;
+                default
+            }
+        };
+
+        if path.exists() && !args.overwrite {
+            bail!(
+                "config file {} already exists; use --overwrite to replace",
+                path.display()
+            );
+        }
+
+        let persist = PersistedConfig {
+            email: email.clone(),
+            password: password.clone(),
+            base_url: Some(base_url.clone()),
+            note_path: note_path.clone(),
+        };
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create config parent {}", parent.display()))?;
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&persist)?)
+            .with_context(|| format!("write config {}", path.display()))?;
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .context("set config permissions")?;
+        next_steps = vec![
+            "weight-gurus-cli auth status".to_string(),
+            "weight-gurus-cli weights weekly".to_string(),
+            "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
+        ];
+    }
+
+    let config_path_display = config_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| {
+            resolve_config_path(None).as_ref().map_or_else(
+                || "/tmp/weight-gurus/config.json".to_string(),
+                |path| path.display().to_string(),
+            )
+        });
+    let wrote_config = args.write;
+
+    Ok(serde_json::to_value(SetupResult {
+        action: "setup",
+        platform: std::env::consts::OS,
+        config_path: config_path_display,
+        config_exists: config.is_some(),
+        config_written: wrote_config,
+        email_present: email.is_some(),
+        email_source: resolved_email.1.as_label(),
+        password_present: password.is_some(),
+        password_source: resolved_password.1.as_label(),
+        base_url,
+        note_path: note_path.clone(),
+        note_path_source: if args.note_path.is_some() {
+            "cli"
+        } else if cli.note_path.is_some() {
+            "cli"
+        } else if config
+            .as_ref()
+            .and_then(|cfg| cfg.note_path.as_ref())
+            .is_some()
+        {
+            "config"
+        } else {
+            "missing"
+        },
+        next_steps,
+    })?)
+}
+
+fn auth_status(
+    cli_email: Option<String>,
+    cli_password: Option<String>,
+    config_path: Option<&Path>,
+    config: &Option<PersistedConfig>,
+    cli_note_path: Option<&str>,
+    base_url: String,
+) -> Result<Value> {
+    let (email_value, email_source) = pick_credential(
+        "email",
+        cli_email,
+        config.as_ref(),
+        |cfg| cfg.email.clone(),
+        true,
+    );
+    let (password_value, password_source) = pick_credential(
+        "password",
+        cli_password,
+        config.as_ref(),
+        |cfg| cfg.password.clone(),
+        true,
+    );
+    let note_path = cli_note_path
+        .map(str::to_string)
+        .or_else(|| config.as_ref().and_then(|cfg| cfg.note_path.clone()));
+
+    Ok(serde_json::to_value(AuthStatusResult {
+        can_authenticate: email_value.is_some() && password_value.is_some(),
+        email_present: email_value.is_some(),
+        email_source: email_source.as_label(),
+        password_present: password_value.is_some(),
+        password_source: password_source.as_label(),
+        base_url,
+        note_path: note_path.clone(),
+        note_path_source: if cli_note_path.is_some() {
+            "cli"
+        } else if note_path.is_some() {
+            "config"
+        } else {
+            "missing"
+        },
+        config_file: config_path.map(|path| path.display().to_string()),
+        config_exists: config.is_some(),
+        keychain_supported: keychain_supported(),
+        keychain_error: None,
+    })?)
+}
+
+fn resolve_base_url(cli_base_url: Option<&str>, config: Option<&PersistedConfig>) -> String {
+    cli_base_url
+        .map(|value| value.to_string())
+        .or_else(|| config.and_then(|cfg| cfg.base_url.clone()))
+        .unwrap_or_else(|| WG_DEFAULT_BASE_URL.to_string())
+}
+
+fn resolve_config_path(explicit_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = explicit_path {
+        return Some(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var(WG_CONFIG_ENV_VAR) {
+        return Some(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("APPDATA").ok();
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var("HOME").ok();
+    home.map(|h| {
+        Path::new(&h)
+            .join(".config")
+            .join(WG_DEFAULT_CONFIG_DIR)
+            .join(WG_DEFAULT_CONFIG_FILE)
+    })
+}
+
+fn read_config_file(path: &Path) -> Result<Option<PersistedConfig>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_str::<PersistedConfig>(&raw)
+            .with_context(|| format!("invalid JSON in config file {}", path.display()))?,
+    ))
+}
+
+fn resolve_note_path(
+    file: Option<&str>,
+    fallback: Option<&str>,
+    config: Option<&PersistedConfig>,
+) -> Result<String> {
+    let path = file
+        .or(fallback)
+        .or_else(|| config.and_then(|cfg| cfg.note_path.as_deref()));
     let Some(path) = path else {
-        bail!("provide --file or set WEIGHT_GURUS_NOTE_PATH for vault commands");
+        bail!("provide --file or set WEIGHT_GURUS_NOTE_PATH");
     };
     Ok(path.to_string())
 }
 
-fn resolve_credentials(
-    cli_email: Option<String>,
-    cli_password: Option<String>,
-) -> Result<(String, String)> {
-    match (cli_email, cli_password) {
-        (Some(email), Some(password)) => Ok((email, password)),
-        (Some(_), None) | (None, Some(_)) => {
-            bail!("provide both --email and --password together, or use keychain credentials")
-        }
-        (None, None) => keychain_credentials(KEYCHAIN_SERVICE_NAME),
+fn prompt_if_missing(label: &str, existing: Option<&str>) -> Result<Option<String>> {
+    if !io::stdin().is_terminal() {
+        return Ok(existing.map(str::to_string));
+    }
+
+    let prompt = match existing {
+        Some(value) => format!("{label} [{}]: ", value),
+        None => format!("{label}: "),
+    };
+    print!("{prompt}");
+    io::stdout().flush().context("failed to write prompt")?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Ok(existing.map(str::to_string))
+    } else {
+        Ok(Some(value))
     }
 }
 
+fn pick_credential(
+    label: &str,
+    cli_value: Option<String>,
+    config: Option<&PersistedConfig>,
+    get_config: impl FnOnce(&PersistedConfig) -> Option<String>,
+    allow_keychain: bool,
+) -> (Option<String>, CredentialSource) {
+    let mut resolved = match cli_value {
+        Some(value) => (Some(value), CredentialSource::Cli),
+        None => {
+            if let Some(cfg) = config.and_then(get_config) {
+                (Some(cfg), CredentialSource::Config)
+            } else {
+                (None, CredentialSource::Missing)
+            }
+        }
+    };
+
+    if resolved.0.is_none() && allow_keychain {
+        match keychain_credentials(KEYCHAIN_SERVICE_NAME) {
+            Ok((email, password)) => {
+                let source_val = match label {
+                    "email" => email,
+                    "password" => password,
+                    _ => String::new(),
+                };
+                resolved = if source_val.is_empty() {
+                    (None, CredentialSource::Missing)
+                } else {
+                    (Some(source_val), CredentialSource::Keychain)
+                };
+            }
+            Err(_) => {}
+        }
+    }
+
+    resolved
+}
+
+fn resolve_credentials_required(
+    cli_email: Option<String>,
+    cli_password: Option<String>,
+    config: Option<&PersistedConfig>,
+) -> Result<CredentialStore> {
+    let (email, email_source) =
+        pick_credential("email", cli_email, config, |cfg| cfg.email.clone(), true);
+    let (password, password_source) = pick_credential(
+        "password",
+        cli_password,
+        config,
+        |cfg| cfg.password.clone(),
+        true,
+    );
+    let _ = email_source;
+    let _ = password_source;
+
+    match (email, password) {
+        (Some(email), Some(password)) => Ok(CredentialStore { email, password }),
+        (None, Some(_)) => bail!(
+            "provided password only; use --email with --password or use config/keychain credentials"
+        ),
+        (Some(_), None) => bail!(
+            "provided email only; use --password with --email or use config/keychain credentials"
+        ),
+        _ => {
+            if !keychain_supported() {
+                bail!(
+                    "provide --email and --password, or set WEIGHT_GURUS_EMAIL and WEIGHT_GURUS_PASSWORD"
+                );
+            }
+            bail!(
+                "credentials missing; provide --email and --password, or set WEIGHT_GURUS_EMAIL and WEIGHT_GURUS_PASSWORD"
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CredentialStore {
+    email: String,
+    password: String,
+}
+
+#[cfg(target_os = "macos")]
 fn keychain_credentials(service: &str) -> Result<(String, String)> {
     let output = Command::new("security")
         .args(["find-generic-password", "-s", service, "-g"])
@@ -326,6 +794,24 @@ fn keychain_credentials(service: &str) -> Result<(String, String)> {
     Ok((email, password))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn keychain_credentials(_service: &str) -> Result<(String, String)> {
+    bail!(
+        "no native credential lookup is configured for this platform; provide --email and --password or set WEIGHT_GURUS_EMAIL and WEIGHT_GURUS_PASSWORD"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_supported() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
 fn decode_security_hex_password(raw: &str) -> Result<String> {
     let hex = raw.trim_start_matches("0x").replace(' ', "");
     if (hex.len() & 1) != 0 {

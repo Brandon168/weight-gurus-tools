@@ -11,8 +11,10 @@ Workflow:
 
 1. Run `weight-gurus-cli auth test` before diagnosing auth issues when credentials should already be configured.
 2. Use `weight-gurus-cli weights raw` for raw exports and `weight-gurus-cli weights weekly` for weekly rollups.
-3. For markdown note changes, run `weight-gurus-cli vault preview --file ...` first.
-4. Only run `weight-gurus-cli vault update --file ... --confirm` when the user explicitly wants a write.
+3. Run `weight-gurus-cli auth status` if a user asks about setup or auth state.
+4. Use `weight-gurus-cli setup --write` for first-time onboarding and to persist settings.
+5. For markdown note changes, run `weight-gurus-cli vault preview --file ...` first.
+6. Only run `weight-gurus-cli vault update --file ... --confirm` when the user explicitly wants a write.
 
 Behavior rules:
 
