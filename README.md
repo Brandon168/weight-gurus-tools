@@ -1,37 +1,28 @@
 # weight-gurus-skill
 
-`weight-gurus-skill` is a small Rust CLI plus agent wrappers for pulling live Weight Gurus data and updating a markdown weight log safely.
+`weight-gurus-skill` is a small Rust CLI plus agent wrappers for fetching and normalizing live Weight Gurus measurement data.
 
 It ships three integration surfaces:
 
 - `weight-gurus-cli`: standalone CLI for any terminal or agent.
-- `skills/weight-gurus`: `SKILL.md`-based skill for Codex and Hermes.
+- `skills/weight-gurus`: `SKILL.md`-based skill for Codex, Hermes, and other skill-aware agents.
 - `integrations/claude/agents/weight-gurus.md`: Claude Code subagent.
 
-## Is this "standard"?
+## Scope
 
-Yes, for the skill bundle. OpenAI documents `SKILL.md` skills as following the Agent Skills open standard, and this repo packages the skill in that format.
-
-- Codex: uses `~/.codex/skills/<name>/SKILL.md`
-- Hermes: uses `~/.hermes/skills/<name>/SKILL.md`
-- Any other `SKILL.md`-aware tool: install the same folder into that tool's skill location
-- Claude Code: uses subagents in `~/.claude/agents/*.md` or slash commands in `~/.claude/commands/*.md`
-
-This repo follows each tool's native extension point instead of forcing one layout everywhere.
+This project owns Weight Gurus access and JSON data shaping. It does not update markdown files, Obsidian vaults, spreadsheets, databases, or other downstream stores. Consumers can use the JSON output however they choose.
 
 ## Features
 
 - `auth test`
 - `auth status`
-- `weights raw`
-- `weights weekly`
+- `weights list`
+- `weights aggregate`
 - `setup`
-- `vault preview`
-- `vault update --confirm`
-- `WEIGHT_GURUS_CONFIG_PATH` config fallback (JSON file)
+- `WEIGHT_GURUS_CONFIG_PATH` config fallback
 - optional macOS Keychain lookup via service `WeightGurus`
 - JSON stdout for agent-friendly use
-- explicit write confirmation for markdown updates
+- source-unit inference plus explicit lb/kg conversion
 
 ## Install the CLI
 
@@ -59,7 +50,7 @@ Or build locally:
 cargo install --path . --locked
 ```
 
-## Configure credentials
+## Configure Credentials
 
 For human setup, run:
 
@@ -72,7 +63,7 @@ That opens an interactive wizard when attached to a terminal and writes local co
 For agents, scripts, SSH sessions without a TTY, or other non-interactive contexts, pass values explicitly:
 
 ```bash
-weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive --note-path "/path/to/Weight Note.md"
+weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive
 ```
 
 Supported inputs:
@@ -80,18 +71,64 @@ Supported inputs:
 - `WEIGHT_GURUS_EMAIL`
 - `WEIGHT_GURUS_PASSWORD`
 - `WEIGHT_GURUS_BASE_URL` for API overrides and tests
-- `WEIGHT_GURUS_NOTE_PATH` for markdown update commands
 - `WEIGHT_GURUS_CONFIG_PATH` to point at a JSON config file
-- `setup` stores local settings to `~/.config/weight-gurus/config.json` by default
 - macOS only: Keychain service `WeightGurus`
-
-You can also pass `--email`, `--password`, and `--file` explicitly.
 
 Cross-platform auth behavior:
 
 - macOS: if no credentials are passed, the CLI can fall back to Keychain service `WeightGurus`
 - Linux and Windows: pass `--email` and `--password`, or set `WEIGHT_GURUS_EMAIL` and `WEIGHT_GURUS_PASSWORD`
-- All platforms: `--file` or `WEIGHT_GURUS_NOTE_PATH` is required for markdown update commands
+
+## CLI Examples
+
+```bash
+weight-gurus-cli auth test
+weight-gurus-cli auth status
+weight-gurus-cli setup
+weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive
+weight-gurus-cli weights list --start 2026-01-01 --end 2026-03-31
+weight-gurus-cli weights list --unit kg --start 2026-01-01 --end 2026-03-31
+weight-gurus-cli weights aggregate --bucket week --start 2026-01-01 --end 2026-03-31
+weight-gurus-cli weights aggregate --bucket month --unit native
+```
+
+## Units
+
+The Weight Gurus API does not return an explicit unit marker in the operation payload used here. The observed API values are tenths of the account display unit:
+
+- app shows `178.2 lbs`
+- API returns `weight: 1782.0`
+- app shows BMI `25.5`
+- API returns `bmi: 255`
+
+By default, `weights list` and `weights aggregate` output pounds. Use `--unit kg` for kilograms or `--unit native` to keep the inferred account unit.
+
+Source unit inference:
+
+- `--source-unit auto` is the default.
+- Auto inference first uses BMI and weight to decide whether lb or kg produces a plausible height.
+- If BMI is unavailable, it falls back to magnitude heuristics.
+- Use `--source-unit lb` or `--source-unit kg` to override inference.
+
+Each listed measurement includes the raw API weight, normalized weight, output unit, inferred source unit, and confidence label.
+
+## Command Shape
+
+`weights list` returns normalized measurement entries between optional dates. Date-only `--start` begins at UTC midnight for that date, and date-only `--end` includes the full end date.
+
+```bash
+weight-gurus-cli weights list --start yyyy-mm-dd --end yyyy-mm-dd
+```
+
+`weights aggregate` groups normalized measurements by day, week, or month:
+
+```bash
+weight-gurus-cli weights aggregate --bucket day
+weight-gurus-cli weights aggregate --bucket week
+weight-gurus-cli weights aggregate --bucket month
+```
+
+Deletes are excluded by default. Use `--include-deleted` to include delete operations.
 
 ## Install in Codex
 
@@ -103,8 +140,6 @@ Build the CLI first, then run:
 
 That installs the skill to `${CODEX_HOME:-~/.codex}/skills/weight-gurus` and symlinks the built binary into `bin/weight-gurus-cli`.
 
-Use it in Codex by selecting the `weight-gurus` skill when needed.
-
 ## Install in Hermes
 
 Build the CLI first, then run:
@@ -114,12 +149,6 @@ Build the CLI first, then run:
 ```
 
 That installs the skill to `${HERMES_HOME:-~/.hermes}/skills/weight-gurus`.
-
-In Hermes, installed skills become available as slash commands. Example:
-
-```text
-/weight-gurus pull my weekly Weight Gurus summary for the last 90 days
-```
 
 ## Install in Claude Code
 
@@ -139,34 +168,6 @@ cargo install --path . --locked
 
 That copies `integrations/claude/agents/weight-gurus.md` to `${CLAUDE_HOME:-~/.claude}/agents/weight-gurus.md`.
 
-Then in Claude Code you can ask:
-
-```text
-Use the weight-gurus subagent to preview an update to my Weight Logs note.
-```
-
-## CLI examples
-
-```bash
-weight-gurus-cli auth test
-weight-gurus-cli auth status
-weight-gurus-cli setup
-weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive --note-path "/path/to/Weight Note.md"
-weight-gurus-cli weights raw --start 2026-01-01 --end 2026-03-31
-weight-gurus-cli weights weekly --start 2026-01-01 --end 2026-03-31
-weight-gurus-cli vault preview --file "/path/to/Weight Note.md"
-weight-gurus-cli vault update --file "/path/to/Weight Note.md" --confirm
-```
-
-## Markdown updater assumptions
-
-The updater is intentionally narrow:
-
-- It looks for headings containing `Weight Log`, `Weight Logs`, or `Weight Log and DEXA`.
-- It removes duplicate Mermaid charts in that section and inserts one canonical chart.
-- It only writes when `--confirm` is present.
-- It leaves content outside the matched section unchanged.
-
 ## Testing
 
 ```bash
@@ -174,7 +175,7 @@ cargo fmt --check
 cargo test
 ```
 
-## Repo layout
+## Repo Layout
 
 ```text
 src/                          Rust CLI

@@ -1,8 +1,8 @@
 [package]
 name = "weight-gurus-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Weight Gurus CLI for raw exports, weekly rollups, and markdown note updates"
+description = "Weight Gurus CLI for authenticated measurement exports and JSON summaries"
 license = "MIT"
 publish = false
 

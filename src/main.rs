@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use regex::Regex;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::Client;
@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const KEYCHAIN_SERVICE_NAME: &str = "WeightGurus";
-const CHART_LINE_COLOR: &str = "#38bdf8";
 const WG_DEFAULT_BASE_URL: &str = "https://api.weightgurus.com";
 const WG_DEFAULT_CONFIG_FILE: &str = "config.json";
 const WG_DEFAULT_CONFIG_DIR: &str = "weight-gurus";
@@ -24,7 +23,7 @@ const WG_CONFIG_ENV_VAR: &str = "WEIGHT_GURUS_CONFIG_PATH";
 #[derive(Parser)]
 #[command(
     name = "weight-gurus-cli",
-    about = "Fetch Weight Gurus data and update markdown logs."
+    about = "Fetch and normalize Weight Gurus measurement data."
 )]
 struct Cli {
     #[arg(long, env = "WEIGHT_GURUS_EMAIL")]
@@ -33,8 +32,6 @@ struct Cli {
     password: Option<String>,
     #[arg(long, env = "WEIGHT_GURUS_BASE_URL")]
     base_url: Option<String>,
-    #[arg(long, env = "WEIGHT_GURUS_NOTE_PATH")]
-    note_path: Option<String>,
     #[arg(long, env = WG_CONFIG_ENV_VAR)]
     config_path: Option<String>,
     #[command(subcommand)]
@@ -52,10 +49,6 @@ enum Commands {
         #[command(subcommand)]
         command: WeightsCommand,
     },
-    Vault {
-        #[command(subcommand)]
-        command: VaultCommand,
-    },
 }
 
 #[derive(Subcommand)]
@@ -66,14 +59,10 @@ enum AuthCommand {
 
 #[derive(Subcommand)]
 enum WeightsCommand {
-    Raw(TimeRange),
-    Weekly(TimeRange),
-}
-
-#[derive(Subcommand)]
-enum VaultCommand {
-    Preview(VaultArgs),
-    Update(VaultUpdateArgs),
+    #[command(about = "List normalized Weight Gurus measurements")]
+    List(WeightListArgs),
+    #[command(about = "Aggregate normalized measurements by day, week, or month")]
+    Aggregate(WeightAggregateArgs),
 }
 
 #[derive(Args)]
@@ -84,22 +73,64 @@ struct TimeRange {
     end: Option<String>,
 }
 
-#[derive(Args)]
-struct VaultArgs {
-    #[arg(long)]
-    file: Option<String>,
-    #[arg(long)]
-    start: Option<String>,
-    #[arg(long)]
-    end: Option<String>,
+#[derive(Clone, Copy, Args)]
+struct UnitArgs {
+    #[arg(long, value_enum, default_value_t = SourceUnit::Auto)]
+    source_unit: SourceUnit,
+    #[arg(long, value_enum, default_value_t = OutputUnit::Lb)]
+    unit: OutputUnit,
 }
 
 #[derive(Args)]
-struct VaultUpdateArgs {
+struct WeightListArgs {
     #[command(flatten)]
-    args: VaultArgs,
-    #[arg(long)]
-    confirm: bool,
+    range: TimeRange,
+    #[command(flatten)]
+    units: UnitArgs,
+    #[arg(
+        long,
+        help = "Include delete operations instead of only active create operations"
+    )]
+    include_deleted: bool,
+}
+
+#[derive(Args)]
+struct WeightAggregateArgs {
+    #[command(flatten)]
+    range: TimeRange,
+    #[command(flatten)]
+    units: UnitArgs,
+    #[arg(long, value_enum, default_value_t = Bucket::Week)]
+    bucket: Bucket,
+    #[arg(
+        long,
+        help = "Include delete operations instead of only active create operations"
+    )]
+    include_deleted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum SourceUnit {
+    Auto,
+    Lb,
+    Kg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum OutputUnit {
+    Lb,
+    Kg,
+    Native,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum Bucket {
+    Day,
+    Week,
+    Month,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +138,9 @@ struct WeightOperation {
     #[serde(rename = "entryTimestamp")]
     pub entry_timestamp: Option<String>,
     pub weight: Option<f64>,
+    pub bmi: Option<f64>,
+    #[serde(rename = "operationType")]
+    pub operation_type: Option<String>,
     #[serde(rename = "entryValue")]
     pub entry_value: Option<f64>,
     pub value: Option<f64>,
@@ -125,7 +159,6 @@ struct PersistedConfig {
     pub email: Option<String>,
     pub password: Option<String>,
     pub base_url: Option<String>,
-    pub note_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,8 +179,6 @@ struct SetupResult {
     password_present: bool,
     password_source: &'static str,
     base_url: String,
-    note_path: Option<String>,
-    note_path_source: &'static str,
     next_steps: Vec<String>,
 }
 
@@ -159,8 +190,6 @@ struct AuthStatusResult {
     password_present: bool,
     password_source: &'static str,
     base_url: String,
-    note_path: Option<String>,
-    note_path_source: &'static str,
     config_file: Option<String>,
     config_exists: bool,
     keychain_supported: bool,
@@ -192,57 +221,67 @@ struct SetupArgs {
     non_interactive: bool,
     #[arg(long, help = "Replace an existing config file without prompting")]
     overwrite: bool,
-    #[arg(long, help = "Markdown note path to save in the config file")]
-    note_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct ParsedWeight {
-    week_ending: NaiveDate,
-    avg_weight: f64,
-    low_weight: f64,
+struct Measurement {
+    entry_timestamp: String,
+    date: NaiveDate,
+    raw_weight: f64,
+    weight: f64,
+    unit: Unit,
+    inferred_source_unit: Unit,
+    source_unit_confidence: &'static str,
+    operation_type: Option<String>,
 }
 
-#[derive(Debug)]
-struct SectionMatch {
-    start: usize,
-    end: usize,
-    text: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Unit {
+    Lb,
+    Kg,
 }
 
 #[derive(Debug, Serialize)]
-struct WeeklyRow {
-    #[serde(rename = "weekEnding")]
-    week_ending: String,
+struct MeasurementOutput {
+    #[serde(rename = "entryTimestamp")]
+    entry_timestamp: String,
+    date: String,
+    #[serde(rename = "rawWeight")]
+    raw_weight: f64,
+    #[serde(rename = "rawScale")]
+    raw_scale: &'static str,
+    weight: f64,
+    unit: Unit,
+    #[serde(rename = "sourceUnit")]
+    source_unit: Unit,
+    #[serde(rename = "sourceUnitConfidence")]
+    source_unit_confidence: &'static str,
+    #[serde(rename = "operationType", skip_serializing_if = "Option::is_none")]
+    operation_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AggregateRow {
+    bucket: String,
     #[serde(rename = "avgWeight")]
     avg_weight: f64,
-    #[serde(rename = "lowWeight")]
-    low_weight: f64,
+    #[serde(rename = "minWeight")]
+    min_weight: f64,
+    #[serde(rename = "maxWeight")]
+    max_weight: f64,
+    count: usize,
     #[serde(rename = "diff")]
     diff: String,
 }
 
 #[derive(Debug, Serialize)]
-struct WeeklySummary {
-    #[serde(rename = "firstWeek")]
-    first_week: Option<String>,
-    #[serde(rename = "lastWeek")]
-    last_week: Option<String>,
-    #[serde(rename = "totalLoss")]
-    total_loss: Option<f64>,
-    #[serde(rename = "avgWeeklyLoss")]
-    avg_weekly_loss: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-struct VaultUpdateResult {
-    file: String,
-    section_found: bool,
-    rows: usize,
-    has_update: bool,
-    mermaid_blocks_removed: usize,
-    updated_section_preview: String,
-    output: Option<String>,
+struct AggregateSummary {
+    first: Option<String>,
+    last: Option<String>,
+    #[serde(rename = "totalChange")]
+    total_change: Option<f64>,
+    unit: Unit,
 }
 
 #[tokio::main]
@@ -277,7 +316,6 @@ async fn run() -> Result<()> {
             cli.password.clone(),
             config_path.as_deref(),
             &config,
-            cli.note_path.as_deref(),
             resolved_base_url.clone(),
         )?,
         Commands::Auth {
@@ -319,82 +357,48 @@ async fn run() -> Result<()> {
                     command: AuthCommand::Status,
                 } => unreachable!(),
                 Commands::Weights {
-                    command: WeightsCommand::Raw(range),
+                    command: WeightsCommand::List(args),
                 } => {
                     let weights = client
                         .get_raw_weights(
-                            parse_opt_datetime(&range.start)?,
-                            parse_opt_datetime(&range.end)?,
+                            parse_opt_start_datetime(&args.range.start)?,
+                            parse_opt_end_datetime(&args.range.end)?,
                         )
                         .await?;
+                    let measurements =
+                        normalize_measurements(&weights, args.units, args.include_deleted)?;
                     serde_json::json!({
-                        "entries": weights,
-                        "count": weights.len(),
-                        "start": range.start.clone(),
-                        "end": range.end.clone(),
+                        "entries": serialize_measurements(&measurements),
+                        "count": measurements.len(),
+                        "start": args.range.start.clone(),
+                        "end": args.range.end.clone(),
+                        "unit": resolved_output_unit(&measurements, args.units.unit),
+                        "sourceUnit": inferred_source_unit_label(&measurements),
                     })
                 }
                 Commands::Weights {
-                    command: WeightsCommand::Weekly(range),
+                    command: WeightsCommand::Aggregate(args),
                 } => {
                     let weights = client
                         .get_raw_weights(
-                            parse_opt_datetime(&range.start)?,
-                            parse_opt_datetime(&range.end)?,
+                            parse_opt_start_datetime(&args.range.start)?,
+                            parse_opt_end_datetime(&args.range.end)?,
                         )
                         .await?;
-                    let rows = build_weekly_rows(&weights)?;
-                    let filtered_rows =
-                        filter_rows_after(&rows, parse_opt_naive_date(&range.start)?);
-                    let serialized_rows: Vec<WeeklyRow> = serialize_weekly_rows(&filtered_rows);
+                    let measurements =
+                        normalize_measurements(&weights, args.units, args.include_deleted)?;
+                    let rows = aggregate_measurements(&measurements, args.bucket);
+                    let unit = resolved_output_unit(&measurements, args.units.unit);
                     serde_json::json!({
-                        "entries": serialized_rows,
-                        "summary": summarize_rows(&filtered_rows),
-                        "count": filtered_rows.len(),
-                        "start": range.start.clone(),
-                        "end": range.end.clone(),
+                        "entries": serialize_aggregate_rows(&rows),
+                        "summary": summarize_aggregate_rows(&rows, unit),
+                        "count": rows.len(),
+                        "bucket": args.bucket,
+                        "start": args.range.start.clone(),
+                        "end": args.range.end.clone(),
+                        "unit": unit,
+                        "sourceUnit": inferred_source_unit_label(&measurements),
                     })
-                }
-                Commands::Vault {
-                    command: VaultCommand::Preview(args),
-                } => {
-                    let file = resolve_note_path(
-                        args.file.as_deref(),
-                        cli.note_path.as_deref(),
-                        config.as_ref(),
-                    )?;
-                    let operation_rows = client
-                        .get_raw_weights(
-                            parse_opt_datetime(&args.start)?,
-                            parse_opt_datetime(&args.end)?,
-                        )
-                        .await?;
-                    let weekly_rows = build_weekly_rows(&operation_rows)?;
-                    let explicit_start = parse_opt_naive_date(&args.start)?;
-                    let result = preview_vault_update(&file, &weekly_rows, explicit_start)?;
-                    serde_json::to_value(result)?
-                }
-                Commands::Vault {
-                    command: VaultCommand::Update(args),
-                } => {
-                    if !args.confirm {
-                        bail!("vault update requires --confirm");
-                    }
-                    let file = resolve_note_path(
-                        args.args.file.as_deref(),
-                        cli.note_path.as_deref(),
-                        config.as_ref(),
-                    )?;
-                    let operation_rows = client
-                        .get_raw_weights(
-                            parse_opt_datetime(&args.args.start)?,
-                            parse_opt_datetime(&args.args.end)?,
-                        )
-                        .await?;
-                    let weekly_rows = build_weekly_rows(&operation_rows)?;
-                    let explicit_start = parse_opt_naive_date(&args.args.start)?;
-                    let result = apply_vault_update(&file, &weekly_rows, explicit_start)?;
-                    serde_json::to_value(result)?
                 }
                 _ => unreachable!(),
             }
@@ -438,15 +442,9 @@ fn setup_command(
     let mut password = resolved_password.0;
     let mut email_source = resolved_email.1;
     let mut password_source = resolved_password.1;
-    let mut note_path = args
-        .note_path
-        .clone()
-        .or(cli.note_path.clone())
-        .or_else(|| config.as_ref().and_then(|c| c.note_path.clone()));
-
     if !args.non_interactive && !io::stdin().is_terminal() {
         bail!(
-            "setup requires an interactive terminal; use --non-interactive with --email, --password, and --note-path"
+            "setup requires an interactive terminal; use --non-interactive with --email and --password"
         );
     }
 
@@ -463,13 +461,10 @@ fn setup_command(
                 password_source = CredentialSource::Cli;
             }
         }
-        if note_path.is_none() {
-            note_path = prompt_if_missing("weight log note path", None)?;
-        }
     }
 
-    if email.is_none() || password.is_none() || note_path.is_none() {
-        bail!("setup requires email, password, and note path");
+    if email.is_none() || password.is_none() {
+        bail!("setup requires email and password");
     }
 
     let path = match config_path {
@@ -500,7 +495,6 @@ fn setup_command(
         email: email.clone(),
         password: password.clone(),
         base_url: Some(base_url.clone()),
-        note_path: note_path.clone(),
     };
 
     if let Some(parent) = path.parent() {
@@ -514,8 +508,8 @@ fn setup_command(
         .context("set config permissions")?;
     let next_steps = vec![
         "weight-gurus-cli auth status".to_string(),
-        "weight-gurus-cli weights weekly".to_string(),
-        "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
+        "weight-gurus-cli weights list".to_string(),
+        "weight-gurus-cli weights aggregate --bucket week".to_string(),
     ];
 
     let config_path_display = config_path
@@ -539,20 +533,6 @@ fn setup_command(
         password_present: password.is_some(),
         password_source: password_source.as_label(),
         base_url,
-        note_path: note_path.clone(),
-        note_path_source: if args.note_path.is_some() {
-            "cli"
-        } else if cli.note_path.is_some() {
-            "cli"
-        } else if config
-            .as_ref()
-            .and_then(|cfg| cfg.note_path.as_ref())
-            .is_some()
-        {
-            "config"
-        } else {
-            "missing"
-        },
         next_steps,
     })?)
 }
@@ -562,7 +542,6 @@ fn auth_status(
     cli_password: Option<String>,
     config_path: Option<&Path>,
     config: &Option<PersistedConfig>,
-    cli_note_path: Option<&str>,
     base_url: String,
 ) -> Result<Value> {
     let (email_value, email_source) = pick_credential(
@@ -579,10 +558,6 @@ fn auth_status(
         |cfg| cfg.password.clone(),
         true,
     );
-    let note_path = cli_note_path
-        .map(str::to_string)
-        .or_else(|| config.as_ref().and_then(|cfg| cfg.note_path.clone()));
-
     Ok(serde_json::to_value(AuthStatusResult {
         can_authenticate: email_value.is_some() && password_value.is_some(),
         email_present: email_value.is_some(),
@@ -590,14 +565,6 @@ fn auth_status(
         password_present: password_value.is_some(),
         password_source: password_source.as_label(),
         base_url,
-        note_path: note_path.clone(),
-        note_path_source: if cli_note_path.is_some() {
-            "cli"
-        } else if note_path.is_some() {
-            "config"
-        } else {
-            "missing"
-        },
         config_file: config_path.map(|path| path.display().to_string()),
         config_exists: config.is_some(),
         keychain_supported: keychain_supported(),
@@ -645,20 +612,6 @@ fn read_config_file(path: &Path) -> Result<Option<PersistedConfig>> {
         serde_json::from_str::<PersistedConfig>(&raw)
             .with_context(|| format!("invalid JSON in config file {}", path.display()))?,
     ))
-}
-
-fn resolve_note_path(
-    file: Option<&str>,
-    fallback: Option<&str>,
-    config: Option<&PersistedConfig>,
-) -> Result<String> {
-    let path = file
-        .or(fallback)
-        .or_else(|| config.and_then(|cfg| cfg.note_path.as_deref()));
-    let Some(path) = path else {
-        bail!("provide --file or set WEIGHT_GURUS_NOTE_PATH");
-    };
-    Ok(path.to_string())
 }
 
 fn prompt_if_missing(label: &str, existing: Option<&str>) -> Result<Option<String>> {
@@ -960,7 +913,7 @@ impl WeightGurusClient {
     }
 }
 
-fn parse_opt_datetime(input: &Option<String>) -> Result<Option<DateTime<Utc>>> {
+fn parse_opt_start_datetime(input: &Option<String>) -> Result<Option<DateTime<Utc>>> {
     let Some(value) = input.as_deref() else {
         return Ok(None);
     };
@@ -970,19 +923,26 @@ fn parse_opt_datetime(input: &Option<String>) -> Result<Option<DateTime<Utc>>> {
     })?))
 }
 
-fn parse_opt_naive_date(input: &Option<String>) -> Result<Option<NaiveDate>> {
+fn parse_opt_end_datetime(input: &Option<String>) -> Result<Option<DateTime<Utc>>> {
     let Some(value) = input.as_deref() else {
         return Ok(None);
     };
 
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return Ok(Some(date));
-    }
-    if let Ok(dt) = parse_datetime_utc(value) {
-        return Ok(Some(dt.date_naive()));
+        let next_midnight = date
+            .checked_add_signed(Duration::days(1))
+            .context("invalid end date")?
+            .and_hms_milli_opt(0, 0, 0, 0)
+            .context("invalid end date")?;
+        return Ok(Some(DateTime::from_naive_utc_and_offset(
+            next_midnight - Duration::milliseconds(1),
+            Utc,
+        )));
     }
 
-    bail!("failed to parse date '{value}'");
+    Ok(Some(parse_datetime_utc(value).with_context(|| {
+        format!("failed to parse datetime '{value}'")
+    })?))
 }
 
 fn parse_datetime_utc(input: &str) -> Result<DateTime<Utc>> {
@@ -1024,20 +984,22 @@ fn extract_weight_value(op: &WeightOperation) -> Result<f64> {
     op.value.context("operation missing weight field")
 }
 
-fn detect_scale_factor(operations: &[WeightOperation]) -> f64 {
+fn normalize_measurements(
+    operations: &[WeightOperation],
+    units: UnitArgs,
+    include_deleted: bool,
+) -> Result<Vec<Measurement>> {
+    let source_unit = infer_source_unit(operations, units.source_unit);
+    let output_unit = match units.unit {
+        OutputUnit::Lb => Unit::Lb,
+        OutputUnit::Kg => Unit::Kg,
+        OutputUnit::Native => source_unit.0,
+    };
+    let mut measurements = Vec::new();
     for op in operations {
-        if let Ok(sample) = extract_weight_value(op) {
-            return if sample > 1000.0 { 0.1 } else { 1.0 };
+        if !include_deleted && op.operation_type.as_deref() == Some("delete") {
+            continue;
         }
-    }
-    1.0
-}
-
-fn build_weekly_rows(operations: &[WeightOperation]) -> Result<Vec<ParsedWeight>> {
-    let scale = detect_scale_factor(operations);
-    let mut grouped: BTreeMap<NaiveDate, Vec<f64>> = BTreeMap::new();
-
-    for op in operations {
         let Some(entry_timestamp) = op.entry_timestamp.as_deref() else {
             continue;
         };
@@ -1053,429 +1015,183 @@ fn build_weekly_rows(operations: &[WeightOperation]) -> Result<Vec<ParsedWeight>
             continue;
         }
 
-        let week_ending = sunday_week_end(entry_time);
-        grouped
-            .entry(week_ending)
-            .or_default()
-            .push(raw_weight * scale);
+        let native_weight = raw_weight / 10.0;
+        let weight = convert_weight(native_weight, source_unit.0, output_unit);
+        measurements.push(Measurement {
+            entry_timestamp: entry_timestamp.to_string(),
+            date: entry_time.date_naive(),
+            raw_weight,
+            weight,
+            unit: output_unit,
+            inferred_source_unit: source_unit.0,
+            source_unit_confidence: source_unit.1,
+            operation_type: op.operation_type.clone(),
+        });
+    }
+    measurements.sort_by(|a, b| a.entry_timestamp.cmp(&b.entry_timestamp));
+    Ok(measurements)
+}
+
+fn infer_source_unit(
+    operations: &[WeightOperation],
+    requested: SourceUnit,
+) -> (Unit, &'static str) {
+    match requested {
+        SourceUnit::Lb => return (Unit::Lb, "user"),
+        SourceUnit::Kg => return (Unit::Kg, "user"),
+        SourceUnit::Auto => {}
     }
 
-    let mut rows: Vec<ParsedWeight> = grouped
-        .into_iter()
-        .map(|(week_ending, values)| {
-            let avg = values.iter().sum::<f64>() / values.len() as f64;
-            let low = values.iter().copied().fold(f64::INFINITY, f64::min);
-            ParsedWeight {
-                week_ending,
-                avg_weight: avg,
-                low_weight: low,
-            }
-        })
-        .collect();
-
-    rows.sort_by_key(|r| r.week_ending);
-    Ok(rows)
-}
-
-fn sunday_week_end(date_time: DateTime<Utc>) -> NaiveDate {
-    let weekday = date_time.date_naive().weekday().num_days_from_monday() as i64;
-    let days_until_sunday = 6 - weekday;
-    date_time
-        .date_naive()
-        .checked_add_signed(Duration::days(days_until_sunday))
-        .unwrap_or_else(|| date_time.date_naive())
-}
-
-fn summarize_rows(rows: &[ParsedWeight]) -> WeeklySummary {
-    if rows.is_empty() {
-        return WeeklySummary {
-            first_week: None,
-            last_week: None,
-            total_loss: None,
-            avg_weekly_loss: None,
+    for op in operations {
+        let (Ok(raw_weight), Some(raw_bmi)) = (extract_weight_value(op), op.bmi) else {
+            continue;
         };
+        if raw_weight <= 0.0 || raw_bmi <= 0.0 {
+            continue;
+        }
+        let weight = raw_weight / 10.0;
+        let bmi = raw_bmi / 10.0;
+        let height_if_lb_inches = ((weight * 703.0) / bmi).sqrt();
+        let height_if_kg_meters = (weight / bmi).sqrt();
+        let lb_plausible = (48.0..=84.0).contains(&height_if_lb_inches);
+        let kg_plausible = (1.35..=2.20).contains(&height_if_kg_meters);
+        match (lb_plausible, kg_plausible) {
+            (true, false) => return (Unit::Lb, "bmi"),
+            (false, true) => return (Unit::Kg, "bmi"),
+            _ => {}
+        }
     }
 
-    let first = &rows[0];
-    let last = rows.last().unwrap_or(&rows[0]);
-    let total_loss = first.avg_weight - last.avg_weight;
-    let weeks = (last.week_ending - first.week_ending).num_days() as f64 / 7.0;
-    let avg_weekly_loss = if weeks > 0.0 {
-        Some(total_loss / weeks)
-    } else {
-        None
-    };
+    for op in operations {
+        if let Ok(raw_weight) = extract_weight_value(op) {
+            let scaled = raw_weight / 10.0;
+            if scaled >= 300.0 {
+                return (Unit::Kg, "magnitude");
+            }
+            if scaled >= 90.0 {
+                return (Unit::Lb, "magnitude");
+            }
+        }
+    }
 
-    WeeklySummary {
-        first_week: Some(first.week_ending.format("%Y-%m-%d").to_string()),
-        last_week: Some(last.week_ending.format("%Y-%m-%d").to_string()),
-        total_loss: Some(total_loss),
-        avg_weekly_loss,
+    (Unit::Lb, "default")
+}
+
+fn convert_weight(value: f64, from: Unit, to: Unit) -> f64 {
+    match (from, to) {
+        (Unit::Lb, Unit::Lb) | (Unit::Kg, Unit::Kg) => value,
+        (Unit::Lb, Unit::Kg) => value * 0.453_592_37,
+        (Unit::Kg, Unit::Lb) => value / 0.453_592_37,
     }
 }
 
-fn serialize_weekly_rows(rows: &[ParsedWeight]) -> Vec<WeeklyRow> {
-    let mut prev_avg: Option<f64> = None;
-    rows.iter()
-        .map(|row| {
-            let diff = prev_avg
-                .map(|prev| {
-                    let delta = row.avg_weight - prev;
-                    format!("{:+.1} lbs", delta)
-                })
-                .unwrap_or_else(|| "-".to_string());
-            prev_avg = Some(row.avg_weight);
+fn resolved_output_unit(measurements: &[Measurement], requested: OutputUnit) -> Unit {
+    match requested {
+        OutputUnit::Lb => Unit::Lb,
+        OutputUnit::Kg => Unit::Kg,
+        OutputUnit::Native => measurements
+            .first()
+            .map(|measurement| measurement.inferred_source_unit)
+            .unwrap_or(Unit::Lb),
+    }
+}
 
-            WeeklyRow {
-                week_ending: row.week_ending.format("%Y-%m-%d").to_string(),
-                avg_weight: round_to_one_dp(row.avg_weight),
-                low_weight: round_to_one_dp(row.low_weight),
+fn inferred_source_unit_label(measurements: &[Measurement]) -> Option<Unit> {
+    measurements
+        .first()
+        .map(|measurement| measurement.inferred_source_unit)
+}
+
+fn serialize_measurements(measurements: &[Measurement]) -> Vec<MeasurementOutput> {
+    measurements
+        .iter()
+        .map(|measurement| MeasurementOutput {
+            entry_timestamp: measurement.entry_timestamp.clone(),
+            date: measurement.date.format("%Y-%m-%d").to_string(),
+            raw_weight: measurement.raw_weight,
+            raw_scale: "tenths",
+            weight: round_to_one_dp(measurement.weight),
+            unit: measurement.unit,
+            source_unit: measurement.inferred_source_unit,
+            source_unit_confidence: measurement.source_unit_confidence,
+            operation_type: measurement.operation_type.clone(),
+        })
+        .collect()
+}
+
+fn aggregate_measurements(measurements: &[Measurement], bucket: Bucket) -> Vec<AggregateRow> {
+    let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for measurement in measurements {
+        grouped
+            .entry(bucket_key(measurement.date, bucket))
+            .or_default()
+            .push(measurement.weight);
+    }
+
+    let mut previous_avg: Option<f64> = None;
+    grouped
+        .into_iter()
+        .map(|(bucket, values)| {
+            let avg = values.iter().sum::<f64>() / values.len() as f64;
+            let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let rounded_avg = round_to_one_dp(avg);
+            let diff = previous_avg
+                .map(|previous| format!("{:+.1}", rounded_avg - previous))
+                .unwrap_or_else(|| "-".to_string());
+            previous_avg = Some(rounded_avg);
+            AggregateRow {
+                bucket,
+                avg_weight: rounded_avg,
+                min_weight: round_to_one_dp(min),
+                max_weight: round_to_one_dp(max),
+                count: values.len(),
                 diff,
             }
         })
         .collect()
 }
 
-fn filter_rows_after(rows: &[ParsedWeight], start: Option<NaiveDate>) -> Vec<ParsedWeight> {
-    let mut filtered = rows.to_vec();
-    if let Some(start_date) = start {
-        filtered.retain(|row| row.week_ending >= start_date);
+fn serialize_aggregate_rows(rows: &[AggregateRow]) -> Vec<&AggregateRow> {
+    rows.iter().collect()
+}
+
+fn summarize_aggregate_rows(rows: &[AggregateRow], unit: Unit) -> AggregateSummary {
+    if rows.is_empty() {
+        return AggregateSummary {
+            first: None,
+            last: None,
+            total_change: None,
+            unit,
+        };
     }
-    filtered
+    let first = rows.first().expect("checked non-empty");
+    let last = rows.last().expect("checked non-empty");
+    AggregateSummary {
+        first: Some(first.bucket.clone()),
+        last: Some(last.bucket.clone()),
+        total_change: Some(round_to_one_dp(last.avg_weight - first.avg_weight)),
+        unit,
+    }
+}
+
+fn bucket_key(date: NaiveDate, bucket: Bucket) -> String {
+    match bucket {
+        Bucket::Day => date.format("%Y-%m-%d").to_string(),
+        Bucket::Week => sunday_week_end(date).format("%Y-%m-%d").to_string(),
+        Bucket::Month => date.format("%Y-%m").to_string(),
+    }
+}
+
+fn sunday_week_end(date: NaiveDate) -> NaiveDate {
+    let weekday = date.weekday().num_days_from_monday() as i64;
+    let days_until_sunday = 6 - weekday;
+    date.checked_add_signed(Duration::days(days_until_sunday))
+        .unwrap_or(date)
 }
 
 fn round_to_one_dp(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
-}
-
-fn preview_vault_update(
-    file: &str,
-    rows: &[ParsedWeight],
-    explicit_start: Option<NaiveDate>,
-) -> Result<VaultUpdateResult> {
-    let content = read_note(file)?;
-    let section = find_weight_section(&content)?;
-    let updated = build_updated_section(&section.text, rows, explicit_start)?;
-
-    let output = format!(
-        "{}{}{}",
-        &content[..section.start],
-        &updated.section_text,
-        &content[section.end..]
-    );
-
-    Ok(VaultUpdateResult {
-        file: file.to_string(),
-        section_found: true,
-        rows: rows.len(),
-        has_update: true,
-        mermaid_blocks_removed: updated.mermaid_blocks_removed,
-        updated_section_preview: updated.section_text,
-        output: Some(output),
-    })
-}
-
-fn apply_vault_update(
-    file: &str,
-    rows: &[ParsedWeight],
-    explicit_start: Option<NaiveDate>,
-) -> Result<VaultUpdateResult> {
-    let content = read_note(file)?;
-    let section = find_weight_section(&content)?;
-    let updated = build_updated_section(&section.text, rows, explicit_start)?;
-    let output_content = format!(
-        "{}{}{}",
-        &content[..section.start],
-        &updated.section_text,
-        &content[section.end..]
-    );
-
-    fs::write(file, output_content)
-        .with_context(|| format!("failed to write updated markdown to {file}"))?;
-
-    Ok(VaultUpdateResult {
-        file: file.to_string(),
-        section_found: true,
-        rows: rows.len(),
-        has_update: true,
-        mermaid_blocks_removed: updated.mermaid_blocks_removed,
-        updated_section_preview: String::new(),
-        output: None,
-    })
-}
-
-fn read_note(path: &str) -> Result<String> {
-    if !Path::new(path).exists() {
-        bail!("markdown file not found: {path}");
-    }
-    fs::read_to_string(path).with_context(|| format!("failed to read markdown file: {path}"))
-}
-
-#[derive(Debug)]
-struct SectionUpdate {
-    section_text: String,
-    mermaid_blocks_removed: usize,
-}
-
-fn build_updated_section(
-    section_text: &str,
-    rows: &[ParsedWeight],
-    explicit_start: Option<NaiveDate>,
-) -> Result<SectionUpdate> {
-    let existing_rows = parse_weekly_table(section_text);
-    let mut rows_map: BTreeMap<NaiveDate, (f64, f64)> = existing_rows
-        .into_iter()
-        .map(|(date, row)| (date, (row.avg_weight, row.low_weight)))
-        .collect();
-
-    let cutoff = explicit_start.or_else(|| rows_map.keys().next().copied());
-    for row in rows {
-        if let Some(cutoff) = cutoff {
-            if row.week_ending < cutoff {
-                continue;
-            }
-        }
-        rows_map.insert(row.week_ending, (row.avg_weight, row.low_weight));
-    }
-
-    let sorted: Vec<(NaiveDate, (f64, f64))> = rows_map.into_iter().collect();
-    let mut updated_lines = vec![
-        "| **Week Ending** | **Avg Weight** | **Diff** |     | ***Low Weight*** |".to_string(),
-        "| --------------- | -------------- | -------- | --- | ---------------- |".to_string(),
-    ];
-
-    let mut prev_avg: Option<f64> = None;
-    let mut chart_values: Vec<f64> = Vec::new();
-    for (date, (avg, low)) in sorted.iter() {
-        let rounded_avg = round_to_one_dp(*avg);
-        let rounded_low = round_to_one_dp(*low);
-        let diff = prev_avg
-            .map(|prev| {
-                let d = rounded_avg - prev;
-                if d == 0.0 {
-                    "0.0 lbs".to_string()
-                } else if d > 0.0 {
-                    format!("{d:+.1} lbs")
-                } else {
-                    format!("{d:.1} lbs")
-                }
-            })
-            .unwrap_or_else(|| "-".to_string());
-
-        prev_avg = Some(rounded_avg);
-        chart_values.push(rounded_avg);
-
-        updated_lines.push(format!(
-            "| {:<15} | {:.1} lbs      | {:<8} |     | *{:.1} lbs*      |",
-            date.format("%Y-%m-%d"),
-            rounded_avg,
-            diff,
-            rounded_low
-        ));
-    }
-
-    let new_table = updated_lines.join("\n");
-    let mermaid_re = Regex::new(r"(?s)```mermaid.*?```").context("invalid mermaid regex")?;
-    let mermaid_blocks_removed = mermaid_re.find_iter(section_text).count();
-    let section_without_mermaid = mermaid_re.replace_all(section_text, "").to_string();
-
-    let table_re = Regex::new(r"(?m)^\|\s*\*\*Week Ending\*\*.*\n\|[^\n]*\n(?:\|.*\n)*")
-        .context("invalid table regex")?;
-    let with_table = if table_re.is_match(&section_without_mermaid) {
-        table_re
-            .replace(&section_without_mermaid, new_table.as_str())
-            .to_string()
-    } else {
-        section_without_mermaid + "\n\n" + &new_table
-    };
-
-    let with_chart = if !chart_values.is_empty() {
-        let values = chart_values
-            .iter()
-            .map(|value| format!("{:.1}", value))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let first = sorted
-            .first()
-            .map(|(d, _)| d.format("%m/%d").to_string())
-            .unwrap_or_default();
-        let last = sorted
-            .last()
-            .map(|(d, _)| d.format("%m/%d").to_string())
-            .unwrap_or_default();
-        let min = sorted
-            .iter()
-            .map(|(_, (avg, _))| *avg)
-            .fold(f64::INFINITY, f64::min);
-        let max = sorted
-            .iter()
-            .map(|(_, (avg, _))| *avg)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let init = serde_json::json!({
-            "themeVariables": {
-                "xyChart": {
-                    "plotColorPalette": CHART_LINE_COLOR,
-                }
-            }
-        });
-        let chart = format!(
-            "```mermaid\n%%{{init: {}}}%%\nxychart-beta\n  title \"Average Weight by Week ({}-{})\"\n  x-axis \"Week\" 1 --> {}\n  y-axis \"Weight (lbs)\" {} --> {}\n  line [{}]\n```",
-            init,
-            first,
-            last,
-            sorted.len(),
-            (min.floor() as i32) - 1,
-            (max.ceil() as i32) + 1,
-            values
-        );
-        with_table.replace(&new_table, &format!("{}\n\n{}", chart, new_table))
-    } else {
-        with_table
-    };
-
-    let final_section = if !sorted.is_empty() {
-        let summaries = summarize_rows(
-            &sorted
-                .iter()
-                .map(|(date, (avg, low))| ParsedWeight {
-                    week_ending: *date,
-                    avg_weight: *avg,
-                    low_weight: *low,
-                })
-                .collect::<Vec<_>>(),
-        );
-
-        let mut summary_lines = Vec::new();
-        if let Some(total) = summaries.total_loss {
-            summary_lines.push(format!("**Total Loss _(based on avg)_:** {:.1} lbs", total));
-        }
-        if let Some(weekly) = summaries.avg_weekly_loss {
-            summary_lines.push(format!("**Avg Weekly Loss:** {:.2} lbs/week", weekly));
-        }
-        replace_or_append_summary(&with_chart, &summary_lines.join("\n"))
-    } else {
-        with_chart
-    };
-
-    Ok(SectionUpdate {
-        mermaid_blocks_removed,
-        section_text: final_section,
-    })
-}
-
-fn find_weight_section(content: &str) -> Result<SectionMatch> {
-    let heading_re = Regex::new(
-        r"(?im)^(#{2,6}\s+[^\n]*\bweight\s+(?:logs?|log)(?:\s*(?:and|&)\s*dexa)?[^\n]*\s*$)",
-    )
-    .context("invalid heading regex")?;
-    let matches: Vec<_> = heading_re.find_iter(content).collect();
-    let Some(first_match) = matches.first() else {
-        bail!("could not find Weight Log/Weight Logs section");
-    };
-    let first_idx = matches
-        .iter()
-        .position(|item| item.start() == first_match.start())
-        .context("failed to locate first section match")?;
-    let end = matches
-        .get(first_idx + 1)
-        .map(|m| m.start())
-        .unwrap_or_else(|| content.len());
-
-    Ok(SectionMatch {
-        start: first_match.start(),
-        end,
-        text: content[first_match.start()..end].to_string(),
-    })
-}
-
-#[derive(Debug)]
-struct ParsedRow {
-    avg_weight: f64,
-    low_weight: f64,
-}
-
-fn parse_weekly_table(section: &str) -> BTreeMap<NaiveDate, ParsedRow> {
-    let table_re = Regex::new(r"(?m)^\|\s*\*\*Week Ending\*\*.*\n\|.*\n(?:\|.*\n)+").unwrap();
-    let mut map = BTreeMap::new();
-
-    let Some(table_match) = table_re.find(section) else {
-        return map;
-    };
-    let table = table_match.as_str();
-    let mut lines = table.lines();
-    let _ = lines.next();
-    let _ = lines.next();
-
-    for line in lines {
-        let cols: Vec<&str> = line
-            .split('|')
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .collect();
-        if cols.len() < 5 {
-            continue;
-        }
-
-        let date = match NaiveDate::parse_from_str(cols[0], "%Y-%m-%d") {
-            Ok(date) => date,
-            Err(_) => continue,
-        };
-        let avg = parse_weight_cell(cols[1]);
-        let low = parse_weight_cell(cols[4]);
-        if let (Some(avg), Some(low)) = (avg, low) {
-            map.insert(
-                date,
-                ParsedRow {
-                    avg_weight: avg,
-                    low_weight: low,
-                },
-            );
-        }
-    }
-
-    map
-}
-
-fn parse_weight_cell(cell: &str) -> Option<f64> {
-    let mut cleaned = cell.replace("lbs", "").replace("*", "").trim().to_string();
-    cleaned = cleaned.replace(',', "").trim().to_string();
-    cleaned.parse::<f64>().ok().map(round_to_one_dp)
-}
-
-fn replace_or_append_summary(section_text: &str, summary_block: &str) -> String {
-    let mut lines: Vec<&str> = section_text.lines().collect();
-    let mut summary_start: Option<usize> = None;
-    let mut summary_end: Option<usize> = None;
-
-    for (idx, line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with("**Total Loss") {
-            summary_start = Some(idx);
-            if let Some(next) = lines.get(idx + 1) {
-                if next.trim_start().starts_with("**Avg Weekly Loss:**") {
-                    summary_end = Some(idx + 2);
-                } else {
-                    summary_end = Some(idx + 1);
-                }
-            } else {
-                summary_end = Some(idx + 1);
-            }
-            break;
-        }
-    }
-
-    match (summary_start, summary_end) {
-        (Some(start), Some(end)) => {
-            lines.splice(start..end, summary_block.lines());
-            lines.join("\n")
-        }
-        _ => {
-            if section_text.ends_with('\n') {
-                format!("{section_text}{summary_block}")
-            } else {
-                format!("{section_text}\n\n{summary_block}")
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1483,105 +1199,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_and_build_weekly_rows() {
+    fn test_normalizes_live_api_tenths_to_lbs() {
         let rows = vec![
-            WeightOperation {
-                entry_timestamp: Some("2026-01-05T10:00:00.000Z".to_string()),
-                weight: Some(2000.0),
-                entry_value: None,
-                value: None,
-                extra: HashMap::new(),
-            },
-            WeightOperation {
-                entry_timestamp: Some("2026-01-08T10:00:00.000Z".to_string()),
-                weight: Some(1990.0),
-                entry_value: None,
-                value: None,
-                extra: HashMap::new(),
-            },
+            test_operation("2026-04-28T12:35:00.000Z", 1782.0, 255.0),
+            test_operation("2026-04-27T12:57:00.000Z", 1782.0, 255.0),
         ];
 
-        let parsed = build_weekly_rows(&rows).expect("rows should parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(
-            parsed[0].week_ending,
-            NaiveDate::from_ymd_opt(2026, 1, 11).unwrap()
-        );
-        assert!((parsed[0].avg_weight - 199.5).abs() < 0.01);
-        assert!((parsed[0].low_weight - 199.0).abs() < 0.01);
+        let parsed = normalize_measurements(
+            &rows,
+            UnitArgs {
+                source_unit: SourceUnit::Auto,
+                unit: OutputUnit::Lb,
+            },
+            false,
+        )
+        .expect("rows should parse");
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].inferred_source_unit, Unit::Lb);
+        assert_eq!(parsed[0].source_unit_confidence, "bmi");
+        assert!((parsed[0].weight - 178.2).abs() < 0.01);
     }
 
     #[test]
-    fn test_parse_weekly_rows_range_filter() {
+    fn test_can_convert_lbs_to_kg() {
+        let rows = vec![test_operation("2026-04-28T12:35:00.000Z", 1782.0, 255.0)];
+        let parsed = normalize_measurements(
+            &rows,
+            UnitArgs {
+                source_unit: SourceUnit::Auto,
+                unit: OutputUnit::Kg,
+            },
+            false,
+        )
+        .expect("rows should parse");
+
+        assert!((parsed[0].weight - 80.8).abs() < 0.1);
+        assert_eq!(parsed[0].unit, Unit::Kg);
+    }
+
+    #[test]
+    fn test_weekly_aggregation_is_generic_bucketed_output() {
         let rows = vec![
-            ParsedWeight {
-                week_ending: NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(),
-                avg_weight: 200.0,
-                low_weight: 198.0,
-            },
-            ParsedWeight {
-                week_ending: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
-                avg_weight: 199.5,
-                low_weight: 198.5,
-            },
+            test_operation("2026-01-05T10:00:00.000Z", 2000.0, 287.0),
+            test_operation("2026-01-08T10:00:00.000Z", 1990.0, 286.0),
+            test_operation("2026-01-12T10:00:00.000Z", 1980.0, 284.0),
         ];
-        let filtered = filter_rows_after(&rows, Some(NaiveDate::from_ymd_opt(2026, 1, 5).unwrap()));
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(
-            filtered[0].week_ending,
-            NaiveDate::from_ymd_opt(2026, 1, 10).unwrap()
-        );
+        let parsed = normalize_measurements(
+            &rows,
+            UnitArgs {
+                source_unit: SourceUnit::Lb,
+                unit: OutputUnit::Lb,
+            },
+            false,
+        )
+        .expect("rows should parse");
+        let aggregate = aggregate_measurements(&parsed, Bucket::Week);
+
+        assert_eq!(aggregate.len(), 2);
+        assert_eq!(aggregate[0].bucket, "2026-01-11");
+        assert_eq!(aggregate[0].avg_weight, 199.5);
+        assert_eq!(aggregate[0].min_weight, 199.0);
+        assert_eq!(aggregate[0].max_weight, 200.0);
+        assert_eq!(aggregate[1].bucket, "2026-01-18");
+        assert_eq!(aggregate[1].diff, "-1.5");
     }
 
-    #[test]
-    fn test_weekly_summary() {
-        let rows = vec![
-            ParsedWeight {
-                week_ending: NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(),
-                avg_weight: 200.0,
-                low_weight: 198.0,
-            },
-            ParsedWeight {
-                week_ending: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
-                avg_weight: 198.0,
-                low_weight: 197.0,
-            },
-            ParsedWeight {
-                week_ending: NaiveDate::from_ymd_opt(2026, 1, 17).unwrap(),
-                avg_weight: 197.0,
-                low_weight: 196.0,
-            },
-        ];
-
-        let summary = summarize_rows(&rows);
-        assert_eq!(summary.first_week.as_deref(), Some("2026-01-03"));
-        assert_eq!(summary.last_week.as_deref(), Some("2026-01-17"));
-        assert_eq!(summary.total_loss, Some(3.0));
-        assert!((summary.avg_weekly_loss.unwrap() - 1.5).abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_weight_section_matches_common_variants() {
-        let text = "## Something\n### Weight Logs\nrow\n## Other";
-        let section = find_weight_section(text).expect("section exists");
-        assert!(section.text.contains("Weight Logs"));
-        let text2 = "### Weight Log and DEXA\nrow\n### End";
-        let section2 = find_weight_section(text2).expect("section exists");
-        assert!(section2.text.contains("Weight Log and DEXA"));
-    }
-
-    #[test]
-    fn test_duplicate_mermaid_is_normalized() {
-        let section = "### Weight Logs\n```mermaid\nchart 1\n```\n\n```mermaid\nchart 2\n```\n| **Week Ending** | **Avg Weight** | **Diff** |     | ***Low Weight*** |\n| --------------- | -------------- | -------- | --- | ---------------- |\n| 2026-01-10 | 200.0 lbs | - |     | *198.0 lbs* |\n";
-        let parsed = vec![ParsedWeight {
-            week_ending: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
-            avg_weight: 200.0,
-            low_weight: 198.0,
-        }];
-        let updated = build_updated_section(section, &parsed, None).expect("should update");
-        let chart_count = updated.section_text.matches("xychart-beta").count();
-        assert_eq!(chart_count, 1);
-        assert_eq!(updated.mermaid_blocks_removed, 2);
-        assert!(updated.section_text.contains("Average Weight by Week"));
+    fn test_operation(timestamp: &str, weight: f64, bmi: f64) -> WeightOperation {
+        WeightOperation {
+            entry_timestamp: Some(timestamp.to_string()),
+            weight: Some(weight),
+            bmi: Some(bmi),
+            operation_type: Some("create".to_string()),
+            entry_value: None,
+            value: None,
+            extra: HashMap::new(),
+        }
     }
 }
