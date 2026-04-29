@@ -188,13 +188,11 @@ impl CredentialSource {
 
 #[derive(Debug, Args)]
 struct SetupArgs {
-    #[arg(long)]
-    write: bool,
-    #[arg(long)]
+    #[arg(long, help = "Use supplied flags/env/config only; never prompt")]
     non_interactive: bool,
-    #[arg(long)]
+    #[arg(long, help = "Replace an existing config file without prompting")]
     overwrite: bool,
-    #[arg(long)]
+    #[arg(long, help = "Markdown note path to save in the config file")]
     note_path: Option<String>,
 }
 
@@ -436,73 +434,89 @@ fn setup_command(
         true,
     );
 
-    let mut next_steps = vec![
-        "weight-gurus-cli auth test".to_string(),
-        "weight-gurus-cli weights weekly".to_string(),
-        "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
-    ];
     let mut email = resolved_email.0;
     let mut password = resolved_password.0;
+    let mut email_source = resolved_email.1;
+    let mut password_source = resolved_password.1;
     let mut note_path = args
         .note_path
         .clone()
         .or(cli.note_path.clone())
         .or_else(|| config.as_ref().and_then(|c| c.note_path.clone()));
 
-    if args.write {
-        if !args.non_interactive {
-            if email.is_none() {
-                email = prompt_if_missing("weight gurus email", email.as_deref())?;
-            }
-            if password.is_none() {
-                password = prompt_if_missing("weight gurus password", password.as_deref())?;
-            }
-            if note_path.is_none() {
-                note_path = prompt_if_missing("weight log note path", None)?;
+    if !args.non_interactive && !io::stdin().is_terminal() {
+        bail!(
+            "setup requires an interactive terminal; use --non-interactive with --email, --password, and --note-path"
+        );
+    }
+
+    if !args.non_interactive {
+        if email.is_none() {
+            email = prompt_if_missing("weight gurus email", email.as_deref())?;
+            if email.is_some() {
+                email_source = CredentialSource::Cli;
             }
         }
-        if email.is_none() || password.is_none() || note_path.is_none() {
-            bail!("setup --write requires email, password, and note path");
-        }
-
-        let path = match config_path {
-            Some(path) => path.to_owned(),
-            None => {
-                let default = resolve_config_path(None)
-                    .context("could not determine default config path for setup write")?;
-                default
+        if password.is_none() {
+            password = prompt_if_missing("weight gurus password", password.as_deref())?;
+            if password.is_some() {
+                password_source = CredentialSource::Cli;
             }
-        };
+        }
+        if note_path.is_none() {
+            note_path = prompt_if_missing("weight log note path", None)?;
+        }
+    }
 
-        if path.exists() && !args.overwrite {
+    if email.is_none() || password.is_none() || note_path.is_none() {
+        bail!("setup requires email, password, and note path");
+    }
+
+    let path = match config_path {
+        Some(path) => path.to_owned(),
+        None => {
+            let default = resolve_config_path(None)
+                .context("could not determine default config path for setup")?;
+            default
+        }
+    };
+
+    if path.exists() && !args.overwrite {
+        if args.non_interactive {
             bail!(
                 "config file {} already exists; use --overwrite to replace",
                 path.display()
             );
         }
-
-        let persist = PersistedConfig {
-            email: email.clone(),
-            password: password.clone(),
-            base_url: Some(base_url.clone()),
-            note_path: note_path.clone(),
-        };
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create config parent {}", parent.display()))?;
+        if !confirm(&format!(
+            "config file {} already exists; replace it? [y/N]: ",
+            path.display()
+        ))? {
+            bail!("setup cancelled");
         }
-        fs::write(&path, serde_json::to_vec_pretty(&persist)?)
-            .with_context(|| format!("write config {}", path.display()))?;
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .context("set config permissions")?;
-        next_steps = vec![
-            "weight-gurus-cli auth status".to_string(),
-            "weight-gurus-cli weights weekly".to_string(),
-            "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
-        ];
     }
+
+    let persist = PersistedConfig {
+        email: email.clone(),
+        password: password.clone(),
+        base_url: Some(base_url.clone()),
+        note_path: note_path.clone(),
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create config parent {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&persist)?)
+        .with_context(|| format!("write config {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .context("set config permissions")?;
+    let next_steps = vec![
+        "weight-gurus-cli auth status".to_string(),
+        "weight-gurus-cli weights weekly".to_string(),
+        "weight-gurus-cli vault preview --file /path/to/note.md".to_string(),
+    ];
 
     let config_path_display = config_path
         .map(|path| path.display().to_string())
@@ -512,7 +526,7 @@ fn setup_command(
                 |path| path.display().to_string(),
             )
         });
-    let wrote_config = args.write;
+    let wrote_config = true;
 
     Ok(serde_json::to_value(SetupResult {
         action: "setup",
@@ -521,9 +535,9 @@ fn setup_command(
         config_exists: config.is_some(),
         config_written: wrote_config,
         email_present: email.is_some(),
-        email_source: resolved_email.1.as_label(),
+        email_source: email_source.as_label(),
         password_present: password.is_some(),
-        password_source: resolved_password.1.as_label(),
+        password_source: password_source.as_label(),
         base_url,
         note_path: note_path.clone(),
         note_path_source: if args.note_path.is_some() {
@@ -648,10 +662,6 @@ fn resolve_note_path(
 }
 
 fn prompt_if_missing(label: &str, existing: Option<&str>) -> Result<Option<String>> {
-    if !io::stdin().is_terminal() {
-        return Ok(existing.map(str::to_string));
-    }
-
     let prompt = match existing {
         Some(value) => format!("{label} [{}]: ", value),
         None => format!("{label}: "),
@@ -666,6 +676,14 @@ fn prompt_if_missing(label: &str, existing: Option<&str>) -> Result<Option<Strin
     } else {
         Ok(Some(value))
     }
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout().flush().context("failed to write prompt")?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    Ok(matches!(value.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn pick_credential(

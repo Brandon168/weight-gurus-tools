@@ -39,16 +39,16 @@ Recommended install path:
 
 - Download the latest GitHub Release for your platform and extract the matching asset.
 
-For example, with `v1.0.0`:
+Platform assets:
 
 - Linux: `weight-gurus-cli-linux-x86_64.tar.gz`
 - macOS (Apple Silicon): `weight-gurus-cli-macos-aarch64.tar.gz`
 - Windows: `weight-gurus-cli-windows-x86_64.zip`
 
 ```bash
-gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-linux-x86_64.tar.gz"
-gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-macos-aarch64.tar.gz"
-gh release download v1.0.0 --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-windows-x86_64.zip"
+gh release download --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-linux-x86_64.tar.gz"
+gh release download --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-macos-aarch64.tar.gz"
+gh release download --repo Brandon168/weight-gurus-tools --pattern "weight-gurus-cli-windows-x86_64.zip"
 ```
 
 Unpack and run `weight-gurus-cli` from the extracted archive.
@@ -60,6 +60,20 @@ cargo install --path . --locked
 ```
 
 ## Configure credentials
+
+For human setup, run:
+
+```bash
+weight-gurus-cli setup
+```
+
+That opens an interactive wizard when attached to a terminal and writes local config to `~/.config/weight-gurus/config.json` by default.
+
+For agents, scripts, SSH sessions without a TTY, or other non-interactive contexts, pass values explicitly:
+
+```bash
+weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive --note-path "/path/to/Weight Note.md"
+```
 
 Supported inputs:
 
@@ -136,7 +150,8 @@ Use the weight-gurus subagent to preview an update to my Weight Logs note.
 ```bash
 weight-gurus-cli auth test
 weight-gurus-cli auth status
-weight-gurus-cli setup --write
+weight-gurus-cli setup
+weight-gurus-cli --email "you@example.com" --password "your-password" setup --non-interactive --note-path "/path/to/Weight Note.md"
 weight-gurus-cli weights raw --start 2026-01-01 --end 2026-03-31
 weight-gurus-cli weights weekly --start 2026-01-01 --end 2026-03-31
 weight-gurus-cli vault preview --file "/path/to/Weight Note.md"

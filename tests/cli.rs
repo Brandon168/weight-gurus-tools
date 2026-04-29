@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::io::Read;
 use std::io::Write;
-use tempfile::NamedTempFile;
+use tempfile::{tempdir, NamedTempFile};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -147,6 +147,55 @@ async fn cli_vault_preview_does_not_write_and_update_requires_confirm() {
         "{}",
         String::from_utf8_lossy(&confirmed_update.stderr)
     );
+}
+
+#[test]
+fn cli_setup_requires_non_interactive_without_tty() {
+    let output = run_cli(&["setup"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("setup requires an interactive terminal")
+    );
+}
+
+#[test]
+fn cli_setup_non_interactive_writes_config() {
+    let dir = tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.json");
+    let note_path = dir.path().join("Weight Note.md");
+    let config_path_str = config_path.to_str().expect("config path");
+    let note_path_str = note_path.to_str().expect("note path");
+
+    let output = run_cli(&[
+        "--email",
+        TEST_EMAIL,
+        "--password",
+        TEST_PASSWORD,
+        "--config-path",
+        config_path_str,
+        "setup",
+        "--non-interactive",
+        "--note-path",
+        note_path_str,
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("setup json");
+    assert_eq!(json["config_written"], true);
+    assert_eq!(json["email_present"], true);
+    assert_eq!(json["password_present"], true);
+    assert_eq!(json["note_path"], note_path_str);
+
+    let config = std::fs::read_to_string(config_path).expect("config written");
+    let config_json: Value = serde_json::from_str(&config).expect("config json");
+    assert_eq!(config_json["email"], TEST_EMAIL);
+    assert_eq!(config_json["password"], TEST_PASSWORD);
+    assert_eq!(config_json["note_path"], note_path_str);
 }
 
 async fn start_mock_server() -> MockServer {

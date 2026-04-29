@@ -17,9 +17,10 @@ Use `weight-gurus-cli` for live Weight Gurus pulls and markdown note updates. Ke
 
 ## Command Map
 
-- Run setup:
+- Run setup for a human user in a terminal:
   - `weight-gurus-cli setup`
-  - `weight-gurus-cli setup --write`
+- Run setup from an agent or script:
+  - `weight-gurus-cli --email "$WEIGHT_GURUS_EMAIL" --password "$WEIGHT_GURUS_PASSWORD" setup --non-interactive --note-path "/path/to/note.md"`
 - Check credential readiness:
   - `weight-gurus-cli auth status`
 - Check credentials:
@@ -46,5 +47,6 @@ Use `weight-gurus-cli` for live Weight Gurus pulls and markdown note updates. Ke
 ## Agent Usage
 
 - Prefer `vault preview` before any update.
+- Do not run interactive `setup` from non-TTY agent contexts; use `setup --non-interactive` with explicit credentials or environment-backed global flags.
 - Use `weight-gurus-cli` installed under `bin/` when available, else PATH fallback.
 - This skill folder is intentionally portable across agent tools that support `SKILL.md`; `agents/openai.yaml` is only for Codex UI metadata.

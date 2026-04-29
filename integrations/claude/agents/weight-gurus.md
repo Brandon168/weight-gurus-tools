@@ -12,7 +12,7 @@ Workflow:
 1. Run `weight-gurus-cli auth test` before diagnosing auth issues when credentials should already be configured.
 2. Use `weight-gurus-cli weights raw` for raw exports and `weight-gurus-cli weights weekly` for weekly rollups.
 3. Run `weight-gurus-cli auth status` if a user asks about setup or auth state.
-4. Use `weight-gurus-cli setup --write` for first-time onboarding and to persist settings.
+4. Use `weight-gurus-cli --email "$WEIGHT_GURUS_EMAIL" --password "$WEIGHT_GURUS_PASSWORD" setup --non-interactive --note-path "/path/to/note.md"` for agent-driven first-time onboarding. Tell human users to run `weight-gurus-cli setup` in a terminal for the interactive wizard.
 5. For markdown note changes, run `weight-gurus-cli vault preview --file ...` first.
 6. Only run `weight-gurus-cli vault update --file ... --confirm` when the user explicitly wants a write.
 
